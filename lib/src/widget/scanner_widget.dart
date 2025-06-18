@@ -2,8 +2,10 @@ import 'dart:io';
 import 'dart:math';
 
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 import 'package:ml_card_scanner/ml_card_scanner.dart';
 import 'package:ml_card_scanner/src/model/typedefs.dart';
 import 'package:ml_card_scanner/src/parser/default_parser_algorithm.dart';
@@ -18,7 +20,6 @@ import 'package:ml_card_scanner/src/widget/text_overlay_widget.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 class ScannerWidget extends StatefulWidget {
-
   final CardOrientation overlayOrientation;
   final OverlayBuilder? overlayBuilder;
   final int scannerDelay;
@@ -50,7 +51,6 @@ class ScannerWidget extends StatefulWidget {
 
 class _ScannerWidgetState extends State<ScannerWidget>
     with WidgetsBindingObserver {
-
   static const _kDebugOutputFilteredImage = false;
   final ValueNotifier<CameraController?> _isInitialized = ValueNotifier(null);
   late ScannerProcessor _processor;
@@ -180,47 +180,76 @@ class _ScannerWidgetState extends State<ScannerWidget>
       _handleError(const ScannerNoCamerasAvailableException());
       return null;
     }
-    if ((cameras.where((cam) => cam.lensDirection == CameraLensDirection.back))
-        .isEmpty) {
+
+    final backCamera = cameras
+        .where((cam) => cam.lensDirection == CameraLensDirection.back)
+        .firstOrNull;
+
+    if (backCamera == null) {
       _handleError(const ScannerNoBackCameraAvailableException());
       return null;
     }
-    _camera = cameras
-        .firstWhere((cam) => cam.lensDirection == CameraLensDirection.back);
+
+    _camera = backCamera;
+
+    // google_mlkit_commons 가이드라인에 따른 카메라 컨트롤러 설정
     final cameraController = CameraController(
       _camera,
       widget.cameraResolution.convertToResolutionPreset(),
       enableAudio: false,
+      // 플랫폼별 최적화된 이미지 포맷 설정
       imageFormatGroup: Platform.isAndroid
-          ? ImageFormatGroup.nv21
-          : ImageFormatGroup.bgra8888,
+          ? ImageFormatGroup.nv21 // Android: nv21 (YUV420)
+          : ImageFormatGroup.bgra8888, // iOS: bgra8888 (RGBA)
     );
-    await cameraController.initialize();
-    final isStreaming = _cameraController?.value.isStreamingImages ?? false;
-    if (_scannerController.scanningEnabled && !isStreaming) {
-      cameraController.startImageStream(_onFrame);
-    }
-    _isInitialized.value = cameraController;
 
-    return cameraController;
+    try {
+      await cameraController.initialize();
+
+      if (!cameraController.value.isInitialized) {
+        cameraController.dispose();
+        _handleError(const ScannerException('Camera initialization failed'));
+        return null;
+      }
+
+      if (kDebugMode) {
+        debugPrint('✅ Camera initialized successfully');
+        debugPrint('📱 Platform: ${Platform.operatingSystem}');
+        debugPrint(
+            '🔧 Requested format: ${Platform.isAndroid ? "nv21" : "bgra8888"}');
+        debugPrint(
+            'ℹ️  Note: Due to GitHub issue #145961, Android may use yuv_420_888 instead of nv21');
+      }
+
+      final isStreaming = _cameraController?.value.isStreamingImages ?? false;
+      if (_scannerController.scanningEnabled && !isStreaming) {
+        await cameraController.startImageStream(_onFrame);
+      }
+
+      _isInitialized.value = cameraController;
+      return cameraController;
+    } catch (e) {
+      cameraController.dispose();
+      _handleError(ScannerException('Camera initialization error: $e'));
+      return null;
+    }
   }
 
   Future<void> _onFrame(CameraImage image) async {
     final cc = _cameraController;
-    if (cc == null) return;
-    if (!cc.value.isInitialized) return;
+    if (cc == null || !cc.value.isInitialized) return;
     if (!_scannerController.scanningEnabled) return;
 
-    if ((DateTime.now().millisecondsSinceEpoch - _lastFrameDecode) <
-        widget.scannerDelay) {
+    final currentTime = DateTime.now().millisecondsSinceEpoch;
+    if ((currentTime - _lastFrameDecode) < widget.scannerDelay) {
       return;
     }
-    _lastFrameDecode = DateTime.now().millisecondsSinceEpoch;
+    _lastFrameDecode = currentTime;
 
-    _handleInputImage(image, cc);
+    await _handleInputImage(image, cc);
   }
 
-  void _handleInputImage(
+  Future<void> _handleInputImage(
     CameraImage image,
     CameraController cc,
   ) async {
@@ -228,6 +257,10 @@ class _ScannerWidgetState extends State<ScannerWidget>
     _isBusy = true;
 
     try {
+      if (!_isImageValid(image)) {
+        return;
+      }
+
       final sensorOrientation = _camera.sensorOrientation;
       final rotation = CameraImageUtil.getImageRotation(
         sensorOrientation,
@@ -236,12 +269,9 @@ class _ScannerWidgetState extends State<ScannerWidget>
       );
 
       if (rotation == null) {
-        _isBusy = false;
-        return;
-      }
-
-      if (image.planes.isEmpty) {
-        _isBusy = false;
+        if (kDebugMode) {
+          debugPrint('Unable to determine image rotation');
+        }
         return;
       }
 
@@ -254,8 +284,74 @@ class _ScannerWidgetState extends State<ScannerWidget>
         }
         _handleData(cardInfo);
       }
-    } catch (_) {}
-    _isBusy = false;
+    } catch (e) {
+      if (kDebugMode) {
+        debugPrint('Error handling input image: $e');
+      }
+    } finally {
+      _isBusy = false;
+    }
+  }
+
+  /// 이미지 유효성 검증 (google_mlkit_commons 가이드라인)
+  bool _isImageValid(CameraImage image) {
+    // 기본 유효성 검사
+    if (image.planes.isEmpty) {
+      if (kDebugMode) {
+        debugPrint('Invalid image: no planes');
+      }
+      return false;
+    }
+
+    if (kDebugMode) {
+      final format = InputImageFormatValue.fromRawValue(image.format.raw);
+      debugPrint(
+          '🔍 Widget validation - Format: $format (raw: ${image.format.raw}), Planes: ${image.planes.length}');
+    }
+
+    // 평면 수 기반 검증 (scanner_processor.dart와 동일한 로직)
+    if (image.planes.length == 3) {
+      // 3개 평면 = YUV420_888 계열 포맷
+      if (Platform.isAndroid) {
+        if (kDebugMode) {
+          debugPrint(
+              '✅ Widget: 3-plane YUV420_888 format detected, will convert to NV21');
+        }
+        return true;
+      } else {
+        if (kDebugMode) {
+          debugPrint('❌ Widget: YUV420_888 format not supported on iOS');
+        }
+        return false;
+      }
+    } else if (image.planes.length == 1) {
+      // 1개 평면 = NV21 또는 BGRA8888
+      final format = InputImageFormatValue.fromRawValue(image.format.raw);
+
+      if (Platform.isAndroid && format == InputImageFormat.nv21) {
+        if (kDebugMode) {
+          debugPrint('✅ Widget: NV21 format validated');
+        }
+        return true;
+      } else if (Platform.isIOS && format == InputImageFormat.bgra8888) {
+        if (kDebugMode) {
+          debugPrint('✅ Widget: BGRA8888 format validated');
+        }
+        return true;
+      } else {
+        if (kDebugMode) {
+          debugPrint(
+              '❌ Widget: Unsupported single-plane format $format on ${Platform.operatingSystem}');
+        }
+        return false;
+      }
+    } else {
+      // 지원하지 않는 평면 수
+      if (kDebugMode) {
+        debugPrint('❌ Widget: Unsupported plane count: ${image.planes.length}');
+      }
+      return false;
+    }
   }
 
   void _scanParamsListener() {
@@ -273,6 +369,12 @@ class _ScannerWidgetState extends State<ScannerWidget>
       _cameraController?.resumePreview();
     } else {
       _cameraController?.pausePreview();
+    }
+
+    if (_scannerController.cameraTorchEnabled) {
+      _cameraController?.setFlashMode(FlashMode.torch);
+    } else {
+      _cameraController?.setFlashMode(FlashMode.off);
     }
   }
 

@@ -10,9 +10,27 @@ class ScannerWidgetController extends ValueNotifier<ScanningParams> {
 
   bool get cameraPreviewEnabled => value.cameraPreviewEnabled;
 
+  bool get cameraTorchEnabled => value.cameraTorchEnabled;
+
   ValueChanged<CardInfo>? get onCardScanned => value.onCardScanned;
 
   ValueChanged<ScannerException>? get onError => value.onError;
+
+  void enableCameraTorch() {
+    if (value.cameraTorchEnabled) {
+      return;
+    }
+    value = value.copyWith(cameraTorchEnabled: true);
+    notifyListeners();
+  }
+
+  void disableCameraTorch() {
+    if (!value.cameraTorchEnabled) {
+      return;
+    }
+    value = value.copyWith(cameraTorchEnabled: false);
+    notifyListeners();
+  }
 
   void enableScanning() {
     if (scanningEnabled) {
@@ -71,5 +89,4 @@ class ScannerWidgetController extends ValueNotifier<ScanningParams> {
     value = value.copyWith(onError: null);
     notifyListeners();
   }
-
 }
