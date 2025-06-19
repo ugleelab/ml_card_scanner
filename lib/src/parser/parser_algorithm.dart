@@ -20,6 +20,9 @@ abstract class ParserAlgorithm {
     if (input[0] == CardParserConst.cardMasterCardParam) {
       return CardParserConst.cardMasterCard;
     }
+    if (input[0] == CardParserConst.cardAmexParam) {
+      return CardParserConst.cardAmex;
+    }
     return CardParserConst.cardUnknown;
   }
 }
